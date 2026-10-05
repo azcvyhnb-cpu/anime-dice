@@ -1,0 +1,928 @@
+--[[
+	ANIME DICE AUTOFARM  -  place 113290951185459 ("[UPD 6] Anime Dice")
+	Interface: Project UAI UI LIB.  Logic ported from the proven "Anime Dice Hub"
+	reference, adapted to the UPD 6 build and re-verified live against it.
+
+	Remote names verified live on UPD 6 (ReplicatedStorage.Network):
+	  RollService.RF.RollDice            SellService.RF.SellInventory
+	  RollService.RE.SetAutoRoll         SellService.RE.UpdateAutoSell
+	  PlotService.RE.CollectBalance      PlotService.RE.EquipBest
+	  RebirthService.RE.Rebirth          Network.RE.BuyUpgrade
+	  DiceShopService.RE.BuyDice/.EquipDice
+	  QuestService.RE.Claim/.Buy         CodesService.RE.RedeemCode
+	  GradeService.RE.Roll               TraitService.RE.Roll
+	  BoostService.RE.Use               SpinService.RE.Use
+	  DailyRewardService.RE.Claim        GroupRewardService.RE.Claim
+	  OfflineEarningsService.RE.Claim    FusingService.RE.Fuse
+
+	The server stays authoritative: it re-rolls rarity/grade/trait server-side and
+	holds the profile. This script only drives the normal calls faster than a human.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local RS = game:GetService("ReplicatedStorage")
+
+-- shared UI library (independent of the agent client) ------------------------
+local UI = loadstring(game:HttpGet(
+	"https://raw.githubusercontent.com/Project-Ptolemy/ProjectUAI/main/dist/uai-ui.lua"
+))()
+
+local window = UI:CreateWindow({
+	Id = "anime-dice-autofarm",
+	Title = "Anime Dice Autofarm",
+	Subtitle = "Roll - sell - collect - upgrade, on autopilot",
+})
+
+-- remotes --------------------------------------------------------------------
+local Net = RS:WaitForChild("Network", 20)
+if not Net then
+	warn("[ADF] no Network folder - wrong game?")
+	return
+end
+
+local function rem(service, class, name)
+	local svc = Net:FindFirstChild(service)
+	local cls = svc and svc:FindFirstChild(class)
+	local r = cls and cls:FindFirstChild(name)
+	if not r then
+		warn("[ADF] missing remote: " .. service .. "." .. class .. "." .. name)
+	end
+	return r
+end
+
+local R = {
+	Roll           = rem("RollService", "RF", "RollDice"),
+	SetAutoRoll    = rem("RollService", "RE", "SetAutoRoll"),
+	SellInventory  = rem("SellService", "RF", "SellInventory"),
+	SellEquipped   = rem("SellService", "RF", "SellEquipped"),
+	UpdateAutoSell = rem("SellService", "RE", "UpdateAutoSell"),
+	CollectBalance = rem("PlotService", "RE", "CollectBalance"),
+	EquipBest      = rem("PlotService", "RE", "EquipBest"),
+	LevelUpSlot    = rem("PlotService", "RE", "LevelUpSlot"),
+	Rebirth        = rem("RebirthService", "RE", "Rebirth"),
+	BuyDice        = rem("DiceShopService", "RE", "BuyDice"),
+	EquipDice      = rem("DiceShopService", "RE", "EquipDice"),
+	QuestClaim     = rem("QuestService", "RE", "Claim"),
+	QuestBuy       = rem("QuestService", "RE", "Buy"),
+	DailyClaim     = rem("DailyRewardService", "RE", "Claim"),
+	GroupClaim     = rem("GroupRewardService", "RE", "Claim"),
+	OfflineClaim   = rem("OfflineEarningsService", "RE", "Claim"),
+	GradeRoll      = rem("GradeService", "RE", "Roll"),
+	TraitRoll      = rem("TraitService", "RE", "Roll"),
+	BoostUse       = rem("BoostService", "RE", "Use"),
+	SpinUse        = rem("SpinService", "RE", "Use"),
+	Fuse           = rem("FusingService", "RE", "Fuse"),
+	Redeem         = rem("CodesService", "RE", "RedeemCode"),
+	TowerPlay      = rem("Towers", "RF", "PlayTower"),
+	TowerFloor     = rem("Towers", "RF", "CompleteTowerFloor"),
+	TowerCancel    = rem("Towers", "RF", "CancelTower"),
+	TowerEquipBest = rem("Towers", "RE", "EquipBestTowerTeam"),
+}
+local topRE = Net:FindFirstChild("RE")
+R.BuyUpgrade = topRE and topRE:FindFirstChild("BuyUpgrade")
+
+-- game config + live state modules (all replicated to the client) ------------
+local function mod(path)
+	local node = RS
+	for seg in string.gmatch(path, "[^%.]+") do
+		node = node and node:FindFirstChild(seg)
+	end
+	if not node then
+		warn("[ADF] missing module " .. path)
+		return nil
+	end
+	local ok, m = pcall(require, node)
+	if not ok then
+		warn("[ADF] require failed " .. path .. ": " .. tostring(m))
+		return nil
+	end
+	return m
+end
+
+local ER       = mod("Framework.Features.Inventory.EntryRegistry")
+local Rar      = mod("Framework.Other.Rarities")
+local DiceCfg  = mod("Framework.Features.Rolling.Dice")
+local Grades   = mod("Framework.Features.Grades.Grades")
+local Traits   = mod("Framework.Features.Traits.Traits")
+local Rebirths = mod("Framework.Features.Rebirth.Rebirths")
+local Upgrades = mod("Framework.Features.Upgrades.Upgrades")
+local Tree     = mod("Framework.Features.Upgrades.TreeStructure")
+local QuestCfg = mod("Framework.Features.Quests.QuestConfig")
+local CodesCfg = mod("Framework.Features.Codes.CodesConfig")
+local D        = mod("Framework.Features.Data.DataController")
+local BuffC    = mod("Framework.Features.Buffs.BuffController")
+local TowersCfg = mod("Framework.Features.Towers.Towers")
+local TowerRefs = mod("Framework.Features.Towers.TowerRefs")
+
+if not (ER and D) then
+	warn("[ADF] core modules unavailable, aborting")
+	return
+end
+
+-- helpers --------------------------------------------------------------------
+local State = {
+	running = true, nextRollAt = 0,
+	towerActive = false, towerStalls = 0, towerCooldown = 0,
+}
+local Stats = {
+	rolls = 0, soldUnits = 0, soldMoney = 0, earned = 0,
+	money = 0, moneyPerMin = 0, rollsPerMin = 0,
+	rares = {}, log = {},
+}
+
+local function pv(fn, ...)
+	local ok, v = pcall(fn, ...)
+	if ok then return v end
+	return nil
+end
+
+local function log(msg)
+	table.insert(Stats.log, 1, os.date("[%H:%M:%S] ") .. msg)
+	while #Stats.log > 14 do
+		table.remove(Stats.log)
+	end
+end
+
+local function money()
+	local v = pv(function() return D.Money() end)
+	return typeof(v) == "number" and v or 0
+end
+
+local function inventory()
+	local v = pv(function() return D.Inventory() end)
+	return typeof(v) == "table" and v or {}
+end
+
+local function slots()
+	local v = pv(function() return D.Slots() end)
+	return typeof(v) == "table" and v or {}
+end
+
+local function amountOf(name)
+	local total = 0
+	for _, e in pairs(inventory()) do
+		if e.name == name then total = total + (tonumber(e.amount) or 0) end
+	end
+	return total
+end
+
+local function buff(name)
+	if not BuffC then return nil end
+	return tonumber(pv(BuffC.GetBuff, name))
+end
+
+local function inventoryCap()
+	return buff("Unit Storage") or 100
+end
+
+local function fmt(n)
+	n = tonumber(n) or 0
+	if n >= 1e15 then return string.format("%.2fQa", n / 1e15) end
+	if n >= 1e12 then return string.format("%.2fT", n / 1e12) end
+	if n >= 1e9 then return string.format("%.2fB", n / 1e9) end
+	if n >= 1e6 then return string.format("%.2fM", n / 1e6) end
+	if n >= 1e3 then return string.format("%.1fK", n / 1e3) end
+	return string.format("%d", math.floor(n))
+end
+
+local function unitEntries()
+	local out = {}
+	for key, e in pairs(inventory()) do
+		local cfg = ER.getEntryConfig(e.name)
+		if cfg and cfg.kind == "Unit" then
+			local attrs = e.attributes or {}
+			table.insert(out, {
+				key = key, name = e.name, attrs = attrs, cfg = cfg,
+				income = tonumber(pv(cfg.income, attrs)) or 0,
+				chance = tonumber(pv(cfg.chance, attrs)) or 0,
+				amount = tonumber(e.amount) or 1,
+			})
+		end
+	end
+	return out
+end
+
+local function plottedKeys()
+	local set = {}
+	for _, s in pairs(slots()) do
+		if typeof(s) == "table" and s.unitId then set[s.unitId] = true end
+	end
+	return set
+end
+
+local A = {} -- action implementations (defined below; referenced by UI callbacks)
+
+-- UI -------------------------------------------------------------------------
+local C = {}          -- live control handles
+local allToggles = {} -- for STOP ALL
+
+local function toggle_(section, spec)
+	local c = section:Toggle(spec)
+	C[spec.Id] = c
+	table.insert(allToggles, c)
+	return c
+end
+
+local function ctl(section, kind, spec)
+	local c = section[kind](section, spec)
+	C[spec.Id] = c
+	return c
+end
+
+local stopAll = function()
+	for _, t in ipairs(allToggles) do
+		if t:Get() then t:Set(false) end
+	end
+	log("STOP ALL - every module disabled")
+end
+
+-- Farm -----------------------------------------------------------------------
+local farmTab = window:Tab({ Title = "Farm" })
+
+local profileSec = farmTab:Section({ Title = "Profile" })
+profileSec:Button({
+	Id = "saveCfg", Text = "Save current settings", ActionText = "Save",
+	Callback = function()
+		local ok, detail = window:SaveConfig("anime-dice-autofarm")
+		window:Notify({
+			Title = ok and "Settings saved" or "Save failed",
+			Content = tostring(detail),
+			Kind = ok and "Success" or "Warning",
+		})
+	end,
+})
+profileSec:Button({
+	Id = "loadCfg", Text = "Load saved settings", ActionText = "Load",
+	Callback = function()
+		local ok, detail = window:LoadConfig("anime-dice-autofarm", { Silent = false })
+		window:Notify({
+			Title = ok and "Settings loaded" or "Load failed",
+			Content = ok and (tostring(detail) .. " value(s) applied") or tostring(detail),
+			Kind = ok and "Success" or "Warning",
+		})
+	end,
+})
+
+local danger = farmTab:Section({ Title = "Emergency" })
+danger:Button({
+	Id = "stopAll", Text = "Stop everything", ActionText = "STOP ALL",
+	Style = "Danger",
+	Callback = function()
+		stopAll()
+		window:Notify({ Title = "Stopped", Content = "All autofarm modules disabled.", Kind = "Warning" })
+	end,
+})
+
+local rollSec = farmTab:Section({ Title = "Rolling" })
+toggle_(rollSec, { Id = "autoRoll", Text = "Auto roll", Default = true })
+ctl(rollSec, "Slider", {
+	Id = "rollInterval", Text = "Roll interval", Min = 2.2, Max = 10, Step = 0.1,
+	Default = 2.9, Suffix = "s",
+})
+rollSec:Button({
+	Id = "rollOnce", Text = "Roll now", ActionText = "Roll",
+	Callback = function()
+		local ok = A.roll(true)
+		window:Notify({
+			Title = ok and "Rolled" or "Roll skipped",
+			Content = ok and "Result added to inventory." or "On cooldown or inventory full.",
+			Kind = ok and "Success" or "Warning",
+		})
+	end,
+})
+
+local sellSec = farmTab:Section({ Title = "Selling" })
+toggle_(sellSec, { Id = "autoSell", Text = "Auto sell junk", Default = true })
+ctl(sellSec, "Slider", {
+	Id = "sellInterval", Text = "Sell loop interval", Min = 3, Max = 60, Step = 1,
+	Default = 8, Suffix = "s",
+})
+ctl(sellSec, "Dropdown", {
+	Id = "sellChance", Text = "Sell units commoner than", Default = 1000,
+	Options = {
+		{ Label = "1 in 100", Value = 100 },
+		{ Label = "1 in 500", Value = 500 },
+		{ Label = "1 in 1,000", Value = 1000 },
+		{ Label = "1 in 5,000", Value = 5000 },
+		{ Label = "1 in 10,000", Value = 10000 },
+		{ Label = "1 in 100,000", Value = 100000 },
+		{ Label = "1 in 1,000,000", Value = 1000000 },
+	},
+})
+ctl(sellSec, "Slider", { Id = "keepTop", Text = "Always keep top", Min = 0, Max = 40, Step = 1, Default = 8 })
+ctl(sellSec, "Slider", {
+	Id = "keepRarity", Text = "Free-space protection up to rarity", Min = 0, Max = 12, Step = 1,
+	Default = 4,
+})
+ctl(sellSec, "Toggle", { Id = "keepMutated", Text = "Never sell mutated units", Default = false })
+ctl(sellSec, "Slider", {
+	Id = "maxUnits", Text = "Inventory target (0 = off)", Min = 0, Max = 150, Step = 5, Default = 70,
+})
+ctl(sellSec, "Slider", { Id = "reserveUnits", Text = "Keep free slots", Min = 5, Max = 100, Step = 5, Default = 20 })
+ctl(sellSec, "Slider", { Id = "sellBatch", Text = "Sell batch size", Min = 10, Max = 100, Step = 10, Default = 60 })
+sellSec:Button({
+	Id = "sellNow", Text = "Sell the junk now", ActionText = "Sell",
+	Callback = function()
+		local sold = A.sell()
+		window:Notify({
+			Title = sold > 0 and ("Sold " .. sold .. " units") or "Nothing to sell",
+			Content = sold > 0 and "Money incoming." or "Inventory is already clean.",
+			Kind = sold > 0 and "Success" or "Info",
+		})
+	end,
+})
+
+local plotSec = farmTab:Section({ Title = "Plot income" })
+toggle_(plotSec, { Id = "autoCollect", Text = "Auto collect balance", Default = true })
+ctl(plotSec, "Slider", { Id = "collectInterval", Text = "Collect interval", Min = 2, Max = 30, Step = 1, Default = 5, Suffix = "s" })
+toggle_(plotSec, { Id = "autoEquipBest", Text = "Auto equip best", Default = true })
+ctl(plotSec, "Slider", { Id = "equipInterval", Text = "Equip interval", Min = 5, Max = 120, Step = 5, Default = 20, Suffix = "s" })
+plotSec:Button({
+	Id = "collectNow", Text = "Collect + equip now", ActionText = "Run",
+	Callback = function()
+		local n = A.collect()
+		A.equipBest()
+		window:Notify({ Title = "Plot updated", Content = "Collected " .. n .. " slot(s) and equipped the best team.", Kind = "Success" })
+	end,
+})
+
+-- Economy --------------------------------------------------------------------
+local ecoTab = window:Tab({ Title = "Economy" })
+
+local upSec = ecoTab:Section({ Title = "Upgrades" })
+toggle_(upSec, { Id = "autoUpgrades", Text = "Auto buy upgrades", Default = true })
+ctl(upSec, "Slider", { Id = "upgradeInterval", Text = "Upgrade interval", Min = 2, Max = 30, Step = 1, Default = 3, Suffix = "s" })
+ctl(upSec, "Input", {
+	Id = "moneyReserve", Text = "Money reserve", Numeric = true, Min = 0,
+	Default = 0, Placeholder = "0",
+})
+
+local rebSec = ecoTab:Section({ Title = "Rebirth" })
+toggle_(rebSec, { Id = "autoRebirth", Text = "Auto rebirth", Default = true })
+ctl(rebSec, "Slider", { Id = "rebirthInterval", Text = "Rebirth check interval", Min = 5, Max = 120, Step = 5, Default = 10, Suffix = "s" })
+
+local diceSec = ecoTab:Section({ Title = "Dice" })
+toggle_(diceSec, { Id = "autoDice", Text = "Auto dice shop", Default = true })
+ctl(diceSec, "Slider", { Id = "diceInterval", Text = "Dice shop interval", Min = 10, Max = 300, Step = 10, Default = 30, Suffix = "s" })
+ctl(diceSec, "Slider", { Id = "diceSpendFrac", Text = "Max spend per buy", Min = 0.05, Max = 1, Step = 0.05, Default = 0.5 })
+
+local shopSec = ecoTab:Section({ Title = "Quest shop" })
+toggle_(shopSec, { Id = "autoQuestShop", Text = "Auto spend tickets", Default = true })
+ctl(shopSec, "Slider", { Id = "questShopPerTick", Text = "Buys per pass", Min = 1, Max = 5, Step = 1, Default = 2 })
+
+-- Extras ---------------------------------------------------------------------
+local extrasTab = window:Tab({ Title = "Extras" })
+
+local qSec = extrasTab:Section({ Title = "Quests and claims" })
+toggle_(qSec, { Id = "autoQuests", Text = "Auto claim quests", Default = true })
+ctl(qSec, "Slider", { Id = "questInterval", Text = "Quest interval", Min = 5, Max = 120, Step = 5, Default = 15, Suffix = "s" })
+toggle_(qSec, { Id = "autoClaims", Text = "Auto daily / group / offline", Default = true })
+ctl(qSec, "Slider", { Id = "claimInterval", Text = "Claim interval", Min = 10, Max = 300, Step = 10, Default = 45, Suffix = "s" })
+
+local gtSec = extrasTab:Section({ Title = "Grade and trait" })
+toggle_(gtSec, { Id = "autoGrade", Text = "Auto grade (spends gems)", Default = true })
+ctl(gtSec, "Slider", { Id = "gradeTarget", Text = "Grade income target", Min = 0, Max = 20, Step = 0.5, Default = 3 })
+toggle_(gtSec, { Id = "autoTrait", Text = "Auto trait (spends rerolls)", Default = true })
+ctl(gtSec, "Slider", { Id = "traitTarget", Text = "Trait income target", Min = 0, Max = 10, Step = 0.5, Default = 2 })
+ctl(gtSec, "Slider", { Id = "gradeInterval", Text = "Reroll interval", Min = 0.2, Max = 3, Step = 0.05, Default = 0.45, Suffix = "s" })
+
+local towerSec = extrasTab:Section({ Title = "Towers" })
+toggle_(towerSec, { Id = "autoTower", Text = "Auto tower (plays floors)", Default = true })
+ctl(towerSec, "Slider", { Id = "towerInterval", Text = "Restart interval", Min = 5, Max = 120, Step = 5, Default = 10, Suffix = "s" })
+ctl(towerSec, "Slider", { Id = "towerFloorInterval", Text = "Floor interval", Min = 0.5, Max = 5, Step = 0.5, Default = 1.5, Suffix = "s" })
+local towerOptions, bestTower = {}, nil
+if TowersCfg and TowersCfg.GetAll then
+	local ok, all = pcall(TowersCfg.GetAll)
+	if ok and typeof(all) == "table" then
+		local list, bestOrder = {}, -1
+		for name, cfg in pairs(all) do
+			table.insert(list, { name = name, order = tonumber(cfg.order) or 0 })
+		end
+		table.sort(list, function(a, b) return a.order > b.order end)
+		for _, t in ipairs(list) do
+			table.insert(towerOptions, t.name)
+			if t.order > bestOrder then
+				bestOrder, bestTower = t.order, t.name
+			end
+		end
+	end
+end
+ctl(towerSec, "Dropdown", {
+	Id = "towerName", Text = "Tower (falls back down the list if it keeps failing)",
+	Options = towerOptions, Default = bestTower, Placeholder = "No towers found",
+})
+towerSec:Button({
+	Id = "equipTowerTeam", Text = "Equip best tower team", ActionText = "Equip",
+	Callback = function()
+		if R.TowerEquipBest then
+			R.TowerEquipBest:FireServer()
+			window:Notify({ Title = "Tower team", Content = "Equip best tower team requested.", Kind = "Success" })
+		end
+	end,
+})
+
+local conSec = extrasTab:Section({ Title = "Consumables" })
+toggle_(conSec, { Id = "autoBoostSpins", Text = "Auto use boosts and spins", Default = true })
+ctl(conSec, "Slider", { Id = "boostInterval", Text = "Boost interval", Min = 10, Max = 120, Step = 10, Default = 30, Suffix = "s" })
+toggle_(conSec, { Id = "autoFuse", Text = "Auto fuse (burns 3 commons)", Default = false })
+ctl(conSec, "Slider", { Id = "fuseInterval", Text = "Fuse interval", Min = 10, Max = 120, Step = 10, Default = 20, Suffix = "s" })
+ctl(conSec, "Input", { Id = "fuseMinMoney", Text = "Min money to fuse", Numeric = true, Min = 0, Default = 1000000, Placeholder = "1000000" })
+toggle_(conSec, { Id = "autoRedeem", Text = "Auto redeem codes", Default = true })
+
+local gameSec = extrasTab:Section({ Title = "Game-side auto sell" })
+ctl(gameSec, "Toggle", {
+	Id = "mirrorAutoSell", Text = "Mirror sell threshold to game AutoSell", Default = false,
+	Callback = function(on)
+		if R.UpdateAutoSell then
+			R.UpdateAutoSell:FireServer(on and (C.sellChance:Get() or 0) or 0)
+		end
+	end,
+})
+
+-- Log ------------------------------------------------------------------------
+local logTab = window:Tab({ Title = "Log" })
+local liveSec = logTab:Section({ Title = "Live" })
+C.badgeMoney  = liveSec:Badge({ Id = "badgeMoney", Text = "Money", Default = "$0", Kind = "Success" })
+C.badgeRolls  = liveSec:Badge({ Id = "badgeRolls", Text = "Rolls / min", Default = "0", Kind = "Secondary" })
+C.badgeEarn   = liveSec:Badge({ Id = "badgeEarn", Text = "Earned / min", Default = "$0", Kind = "Secondary" })
+C.badgeUnits  = liveSec:Badge({ Id = "badgeUnits", Text = "Units", Default = "0", Kind = "Secondary" })
+
+local feedSec = logTab:Section({ Title = "Feed" })
+local logLabel = feedSec:Label({ Id = "logFeed", Text = "Waiting for the first action...", Description = "" })
+feedSec:Button({
+	Id = "clearLog", Text = "Clear feed", ActionText = "Clear",
+	Callback = function()
+		table.clear(Stats.log)
+		logLabel:SetText("Feed cleared.")
+	end,
+})
+
+local function refreshLog()
+	local lines = {}
+	for _, entry in ipairs(Stats.log) do
+		table.insert(lines, entry)
+	end
+	if #lines == 0 then lines = { "No activity yet." } end
+	logLabel:SetText(table.concat(lines, "\n"))
+end
+
+-- extra Rolling control, kept with the roll settings in the Farm tab ----------
+ctl(rollSec, "Dropdown", {
+	Id = "rareLogChance", Text = "Log rolls rarer than", Default = 1000,
+	Options = {
+		{ Label = "1 in 100", Value = 100 },
+		{ Label = "1 in 500", Value = 500 },
+		{ Label = "1 in 1,000", Value = 1000 },
+		{ Label = "1 in 5,000", Value = 5000 },
+		{ Label = "1 in 50,000", Value = 50000 },
+		{ Label = "1 in 1,000,000", Value = 1000000 },
+	},
+})
+
+-- actions --------------------------------------------------------------------
+local function rarityOrder(name)
+	if Rar and Rar.Get and name then
+		local r = pv(Rar.Get, name)
+		if typeof(r) == "table" and tonumber(r.sortOrder) then return tonumber(r.sortOrder) end
+	end
+	return 1
+end
+
+function A.roll(force)
+	if not R.Roll then return false end
+	if not force and os.clock() < State.nextRollAt then return false end
+	local ok, res = pcall(R.Roll.InvokeServer, R.Roll)
+	if not ok or typeof(res) ~= "table" then
+		-- throttled by the server, or the inventory is too full to accept a unit
+		State.nextRollAt = os.clock() + 0.4
+		local cap = inventoryCap()
+		local n = #unitEntries()
+		if n >= cap - 5 and os.clock() - (State.lastEmergencySell or 0) > 4 then
+			State.lastEmergencySell = os.clock()
+			log("inventory near cap (" .. n .. "/" .. cap .. ") - emergency sell")
+			task.spawn(A.sell)
+		end
+		return false
+	end
+	State.nextRollAt = os.clock() + (C.rollInterval:Get() or 2.9)
+	Stats.rolls = Stats.rolls + 1
+	local threshold = C.rareLogChance:Get() or 1000
+	for _, r in ipairs(res) do
+		if typeof(r) == "table" and r.result then
+			local cfg = ER.getEntryConfig(r.result)
+			local ch = cfg and (tonumber(pv(cfg.chance, { mutation = r.mutation })) or 0) or 0
+			if ch >= threshold then
+				local label = tostring(r.result)
+				if r.mutation then label = tostring(r.mutation) .. " " .. label end
+				table.insert(Stats.rares, 1, label .. " (1/" .. fmt(ch) .. ")")
+				while #Stats.rares > 8 do table.remove(Stats.rares) end
+				log("ROLLED " .. label .. " 1 in " .. fmt(ch))
+			end
+		end
+	end
+	return true
+end
+
+local function sellList()
+	local plotted = plottedKeys()
+	local units = unitEntries()
+	table.sort(units, function(a, b) return a.income > b.income end)
+	local seen, list = {}, {}
+	local function add(u)
+		if not seen[u.key] then
+			seen[u.key] = true
+			table.insert(list, u.key)
+		end
+	end
+
+	local sellChance = C.sellChance:Get() or 1000
+	local keepTop = C.keepTop:Get() or 0
+	local keepMutated = C.keepMutated:Get()
+
+	-- tier 1: the routine junk pass
+	for i, u in ipairs(units) do
+		if i > keepTop and u.chance < sellChance and not u.attrs.locked
+			and not plotted[u.key] and not (keepMutated and u.attrs.mutation) then
+			add(u)
+		end
+	end
+
+	local cap = inventoryCap()
+	local remaining = #units - #list
+	local maxUnits = C.maxUnits:Get() or 0
+
+	-- tier 2: compaction down to the inventory target
+	if maxUnits > 0 and remaining > maxUnits then
+		for i = #units, 1, -1 do
+			if remaining <= maxUnits then break end
+			local u = units[i]
+			if i > keepTop and not u.attrs.locked and not plotted[u.key] and not seen[u.key] then
+				add(u)
+				remaining = remaining - 1
+			end
+		end
+	end
+
+	local reserve = C.reserveUnits:Get() or 20
+	local keepRarity = C.keepRarity:Get() or 4
+
+	-- tier 3: free-space protection (still keeps locked, plotted and top units)
+	if remaining > cap - reserve then
+		for i = #units, 1, -1 do
+			if remaining <= cap - reserve then break end
+			local u = units[i]
+			if i > keepTop and not u.attrs.locked and not plotted[u.key]
+				and rarityOrder(u.cfg.rarity) < keepRarity and not seen[u.key] then
+				add(u)
+				remaining = remaining - 1
+			end
+		end
+	end
+
+	-- tier 4: emergency - the server is about to refuse every roll
+	if remaining > cap - 5 then
+		for i = #units, 1, -1 do
+			if remaining <= cap - 10 then break end
+			local u = units[i]
+			if i > 3 and not u.attrs.locked and not plotted[u.key] and not seen[u.key] then
+				add(u)
+				remaining = remaining - 1
+			end
+		end
+	end
+
+	return list, #units, cap
+end
+
+function A.sell()
+	if not R.SellInventory then return 0 end
+	local list, unitCount, cap = sellList()
+	if #list == 0 then return 0 end
+	local batchSize = math.max(1, math.floor(C.sellBatch:Get() or 60))
+	local sold, gained, i = 0, 0, 1
+	while i <= #list do
+		local batch = {}
+		for j = i, math.min(i + batchSize - 1, #list) do
+			table.insert(batch, list[j])
+		end
+		local ok, moneyGained, unitsSold = pcall(R.SellInventory.InvokeServer, R.SellInventory, batch)
+		if ok then
+			if typeof(unitsSold) == "number" then sold = sold + unitsSold end
+			if typeof(moneyGained) == "number" then gained = gained + moneyGained end
+		end
+		i = i + batchSize
+		if i <= #list then task.wait(0.15) end
+	end
+	if sold > 0 then
+		Stats.soldUnits = Stats.soldUnits + sold
+		Stats.soldMoney = Stats.soldMoney + gained
+		log(string.format("sold %d units for %s (%d/%d left)", sold, fmt(gained), unitCount - sold, cap))
+	end
+	return sold
+end
+
+function A.collect()
+	if not R.CollectBalance then return 0 end
+	local n = 0
+	for i, s in pairs(slots()) do
+		local idx = tonumber(i)
+		if idx and typeof(s) == "table" and (tonumber(s.balance) or 0) > 0 then
+			R.CollectBalance:FireServer(idx)
+			n = n + 1
+		end
+	end
+	return n
+end
+
+function A.equipBest()
+	if R.EquipBest then R.EquipBest:FireServer() end
+end
+
+function A.upgrades()
+	if not (Upgrades and R.BuyUpgrade) then return 0 end
+	local owned = pv(function() return D.Upgrades() end) or {}
+	local cash = money()
+	local reserve = tonumber(C.moneyReserve:Get()) or 0
+	local cands = {}
+	for name, u in pairs(Upgrades) do
+		local price = tonumber(u.price)
+		if not owned[name] and price then
+			local parent = Tree and Tree.GetParent and pv(Tree.GetParent, name)
+			if parent == nil or parent == "Start" or owned[parent] == true then
+				table.insert(cands, { name = name, price = price })
+			end
+		end
+	end
+	table.sort(cands, function(a, b) return a.price < b.price end)
+	local bought = 0
+	for _, c in ipairs(cands) do
+		if cash - c.price >= reserve then
+			R.BuyUpgrade:FireServer(c.name)
+			cash = cash - c.price
+			bought = bought + 1
+			if bought >= 3 then break end
+			task.wait(0.05)
+		else
+			break
+		end
+	end
+	if bought > 0 then log("bought " .. bought .. " upgrade(s)") end
+	return bought
+end
+
+function A.quests()
+	if not (QuestCfg and R.QuestClaim) then return 0 end
+	local snapAll = pv(function() return D.Quests() end)
+	if typeof(snapAll) ~= "table" then return 0 end
+	local claimedN = 0
+	for pname, pcfg in pairs(QuestCfg.Periods or {}) do
+		local snap = snapAll[pname]
+		if typeof(snap) == "table" then
+			local progress = snap.progress or {}
+			local claimed = snap.claimed or {}
+			for _, quest in ipairs(pcfg.quests or {}) do
+				local id = quest.id
+				if id and (tonumber(progress[id]) or 0) >= (tonumber(quest.target) or math.huge)
+					and not claimed[id] then
+					R.QuestClaim:FireServer(pname, id, snap.expiresAt)
+					claimedN = claimedN + 1
+					log("quest claimed: " .. pname .. "/" .. tostring(id)
+						.. " (+" .. tostring(quest.tickets) .. " tickets)")
+					task.wait(0.3)
+				end
+			end
+		end
+	end
+	return claimedN
+end
+	if not (TowersCfg and R.TowerPlay) then return false end
+	local now = os.clock()
+
+	if State.towerActive then
+		local ok, events = pcall(R.TowerFloor.InvokeServer, R.TowerFloor)
+		local ended, got = false, false
+		if ok and typeof(events) == "table" then
+			got = #events > 0
+			for _, ev in ipairs(events) do
+				if typeof(ev) == "table" and ev.action == TOWER_ENDED then
+					ended = true
+				end
+			end
+		end
+		if ended then
+			State.towerActive = false
+			State.towerStalls = 0
+			State.towerFail = 0
+			State.towerCooldown = now + (C.towerInterval:Get() or 10)
+			log("tower run ended: " .. tostring(State.towerCurrent))
+			return true
+		end
+		if got then
+			State.towerStalls = 0
+			return true
+		end
+		State.towerStalls = (State.towerStalls or 0) + 1
+		if State.towerStalls >= 3 then
+			State.towerActive = false
+			State.towerStalls = 0
+			State.towerFail = (State.towerFail or 0) + 1
+			State.towerCooldown = now + (C.towerInterval:Get() or 10) * 3
+			if R.TowerCancel then pcall(R.TowerCancel.InvokeServer, R.TowerCancel) end
+			local idx = State.towerIdx or 1
+			if State.towerFail >= 2 and State.towerOrder and idx < #State.towerOrder then
+				State.towerIdx = idx + 1
+				State.towerFail = 0
+				log("tower struggles on " .. tostring(State.towerCurrent)
+					.. " - switching to " .. State.towerOrder[idx + 1])
+			else
+				log("tower stalled on " .. tostring(State.towerCurrent) .. " - retrying later")
+			end
+		end
+		return true
+	end
+
+	if now < (State.towerCooldown or 0) then return false end
+
+	local team = pv(function() return D.TowerTeam() end)
+	local hasTeam = false
+	if typeof(team) == "table" then
+		for _, v in pairs(team) do
+			if v and v ~= "" then
+				hasTeam = true
+				break
+			end
+		end
+	end
+	if not hasTeam then
+		if R.TowerEquipBest then R.TowerEquipBest:FireServer() end
+		State.towerCooldown = now + 4
+		log("tower: no team set, equipping best team")
+		return false
+	end
+
+	local order = towerOrder()
+	if #order == 0 then return false end
+	State.towerOrder = order
+
+	local pick = C.towerName and C.towerName:Get() or nil
+	if pick ~= State.lastTowerPick then
+		State.lastTowerPick = pick
+		State.towerIdx = nil
+	end
+	if State.towerIdx == nil then
+		State.towerIdx = 1
+		if typeof(pick) == "string" then
+			for i, n in ipairs(order) do
+				if n == pick then State.towerIdx = i end
+			end
+		end
+	end
+	local name = order[State.towerIdx] or order[1]
+	State.towerCurrent = name
+
+	local ok, res = pcall(R.TowerPlay.InvokeServer, R.TowerPlay, name)
+	if ok and res then
+		State.towerActive = true
+		State.towerStalls = 0
+		log("tower started: " .. name)
+		return true
+	end
+	-- PlayTower can refuse because a run is still live server-side (e.g. after a
+	-- script reload). Try to adopt it instead of waiting forever.
+	local okF, events = pcall(R.TowerFloor.InvokeServer, R.TowerFloor)
+	if okF and typeof(events) == "table" and #events > 0 then
+		State.towerActive = true
+		State.towerStalls = 0
+		log("tower run adopted: " .. tostring(State.towerCurrent))
+		return true
+	end
+	State.towerCooldown = now + 8
+	return false
+end
+
+-- scheduler ------------------------------------------------------------------
+-- Heartbeat driven: every entry is a cheap gate check; real work runs in its
+-- own thread so a blocking InvokeServer never stalls the frame.
+local Tasks = {}
+local function register(name, interval, fn, gate)
+	Tasks[name] = { interval = interval, fn = fn, gate = gate, last = 0, running = false }
+end
+
+local function gateOpen(gate)
+	if gate == nil then return true end
+	if typeof(gate) == "function" then return gate() and true or false end
+	local c = C[gate]
+	return c ~= nil and c:Get() == true
+end
+
+register("roll", function() return 0.4 end, A.roll, "autoRoll")
+register("collect", function() return C.collectInterval:Get() or 5 end, A.collect, "autoCollect")
+register("sell", function()
+	if #unitEntries() >= inventoryCap() - (C.reserveUnits:Get() or 20) then return 2 end
+	return C.sellInterval:Get() or 8
+end, A.sell, "autoSell")
+register("equipBest", function() return C.equipInterval:Get() or 20 end, A.equipBest, "autoEquipBest")
+register("upgrades", function() return C.upgradeInterval:Get() or 3 end, A.upgrades, "autoUpgrades")
+register("quests", function() return C.questInterval:Get() or 15 end, A.quests, "autoQuests")
+register("questShop", function() return C.questInterval:Get() or 15 end, A.questShop, "autoQuestShop")
+register("claims", function() return C.claimInterval:Get() or 45 end, A.claims, "autoClaims")
+register("gradeTrait", function() return C.gradeInterval:Get() or 0.45 end, A.gradeTrait,
+	function() return C.autoGrade:Get() or C.autoTrait:Get() end)
+register("dice", function() return C.diceInterval:Get() or 30 end, A.dice, "autoDice")
+register("boostSpins", function() return C.boostInterval:Get() or 30 end, A.boostSpins, "autoBoostSpins")
+register("redeem", function() return 5 end, A.redeem, "autoRedeem")
+register("rebirth", function() return C.rebirthInterval:Get() or 10 end, A.rebirth, "autoRebirth")
+register("fuse", function() return C.fuseInterval:Get() or 20 end, A.fuse, "autoFuse")
+register("tower", function()
+	if State.towerActive then return C.towerFloorInterval:Get() or 1.5 end
+	return C.towerInterval:Get() or 10
+end, A.tower, "autoTower")
+
+local moneySamples, rollSamples = {}, {}
+local function updateStats()
+	Stats.money = money()
+	local now = os.clock()
+	local prev = State.lastMoney
+	if prev and Stats.money > prev then
+		Stats.earned = Stats.earned + (Stats.money - prev)
+	end
+	State.lastMoney = Stats.money
+
+	table.insert(moneySamples, { t = now, m = Stats.earned })
+	while #moneySamples > 2 and now - moneySamples[1].t > 60 do table.remove(moneySamples, 1) end
+	local a, b = moneySamples[1], moneySamples[#moneySamples]
+	if b.t - a.t > 5 then Stats.moneyPerMin = (b.m - a.m) / (b.t - a.t) * 60 end
+
+	table.insert(rollSamples, { t = now, n = Stats.rolls })
+	while #rollSamples > 2 and now - rollSamples[1].t > 60 do table.remove(rollSamples, 1) end
+	local ra, rb = rollSamples[1], rollSamples[#rollSamples]
+	if rb.t - ra.t > 5 then Stats.rollsPerMin = (rb.n - ra.n) / (rb.t - ra.t) * 60 end
+
+	if not window.Alive then return end
+	C.badgeMoney:Set("$" .. fmt(Stats.money))
+	C.badgeRolls:Set(string.format("%.1f", Stats.rollsPerMin))
+	C.badgeEarn:Set("$" .. fmt(Stats.moneyPerMin))
+	C.badgeUnits:Set(tostring(#unitEntries()) .. "/" .. tostring(inventoryCap()))
+	refreshLog()
+end
+register("stats", function() return 1 end, updateStats, nil)
+
+local function runTask(name, t)
+	local iv = typeof(t.interval) == "function" and t.interval() or t.interval
+	if os.clock() - t.last < iv then return end
+	t.last = os.clock()
+	t.running = true
+	task.spawn(function()
+		local ok, err = pcall(t.fn)
+		t.running = false
+		if not ok then
+			log(name .. ": " .. tostring(err))
+		end
+	end)
+end
+
+local function schedulerTick()
+	for name, t in pairs(Tasks) do
+		if gateOpen(t.gate) and not t.running then
+			runTask(name, t)
+		end
+	end
+end
+
+window:Give(RunService.Heartbeat:Connect(function()
+	if not State.running then return end
+	local ok, err = pcall(schedulerTick)
+	if not ok then
+		warn("[ADF] scheduler: " .. tostring(err))
+	end
+end))
+
+window:OnDestroy(function()
+	State.running = false
+end)
+
+-- console handle --------------------------------------------------------------
+local function killSwitch()
+	State.running = false
+	for _, t in ipairs(allToggles) do
+		t:Set(false)
+	end
+end
+getgenv().__ANIME_DICE_AUTOFARM = {
+	stop = killSwitch,
+	stats = Stats,
+	state = State,
+	controls = C,
+	window = window,
+}
+
+-- startup ---------------------------------------------------------------------
+log("Autofarm ready - UPD 6 remote map verified against this build")
+log("First actions land within a few seconds; Farm > Stop everything halts")
+refreshLog()
+window:Notify({
+	Title = "Anime Dice Autofarm",
+	Content = "Modules are live. Farm tab has the controls, Log tab shows progress.",
+	Kind = "Success",
+	Duration = 6,
